@@ -1,56 +1,259 @@
 # rvLLM Serverless for RunPod
 
+![Status: WIP](https://img.shields.io/badge/status-WIP-orange)
+
 RunPod Serverless wrapper for [`rvLLM`](https://github.com/m0at/rvllm), keeping the Rust inference server intact and adding only the minimal serverless layer needed for deployment.
 
-This repository is intentionally shaped like the official RunPod worker repositories:
+This repo follows the shape of the official RunPod worker repos:
 
-- one generic image that lets users choose a `MODEL_ID` at deploy time
-- one baked-image path that downloads a specific model into the image at build time
-- a small Python handler that starts `rvllm serve`, waits for `/health`, and proxies RunPod jobs to the local OpenAI-compatible API
+- a thin Python `runpod.serverless.start(...)` handler
+- `rvllm serve` running as the local OpenAI-compatible backend
+- generic-image deployment with `MODEL_ID` at runtime
+- baked-image deployment with a model snapshot inside the image
+
+## Current Status
+
+- generic serverless image is built and published
+- tested against real RunPod GPU workers
+- validated startup path after fixing missing PTX kernel packaging
+- still WIP in the sense that the deployment ergonomics and tuning will keep improving
+
+## Published Image
+
+Current test image:
+
+- `reniyap/rvllm-serverless:exp-20260401`
+- digest: `sha256:9fa7c365b125f15ad7f703d7952ba5b41291e8d14bea00efa0be52cdf2552e0d`
+
+If you want the most deterministic pull in RunPod, use the digest form:
+
+```text
+reniyap/rvllm-serverless@sha256:9fa7c365b125f15ad7f703d7952ba5b41291e8d14bea00efa0be52cdf2552e0d
+```
 
 ## Why This Shape
 
-`rvLLM` already has the hard part:
+`rvLLM` already handles the core inference work:
 
-- OpenAI-compatible HTTP routes
-- Hugging Face model-id support
-- fast startup and much smaller runtime footprint than Python `vLLM`
+- OpenAI-compatible HTTP API
+- Hugging Face model-id loading
+- Rust-native runtime with much smaller overhead than Python `vLLM`
 
-So this serverless layer does **not** re-implement inference. It does three things only:
+This serverless layer only does three things:
 
 1. Launch `rvllm serve` with env-driven configuration.
-2. Translate RunPod job inputs into local HTTP requests.
-3. Rewrite model names when the public model name differs from the local baked path.
+2. Wait for `/health`.
+3. Proxy RunPod jobs to the local OpenAI-compatible API.
 
-That keeps the serverless repo easy to reason about and keeps `rvLLM` front-and-center.
+That keeps `rvLLM` itself respected and avoids growing a second inference implementation in Python.
 
-## Deployment Modes
+## Quick Start
 
-### 1. Generic Image + `MODEL_ID` at Deploy Time
+### Option 1. Use the Published Image in RunPod
 
-Build a reusable image once, then choose the model from RunPod endpoint environment variables.
+In RunPod Serverless:
 
-Use this when:
+1. Create a `Custom deployment`.
+2. Choose `Deploy from Docker registry`.
+3. Use the image above.
+4. Set endpoint type to `Queue-based`.
+5. Leave `Container start command` empty.
+6. Leave `Expose HTTP ports` and `Expose TCP ports` empty.
+7. Add runtime env vars like this:
 
-- you want one image for many models
-- you are okay with first-boot Hugging Face download time
-- you want a RunPod Hub style workflow
+```env
+MODEL_ID=Qwen/Qwen2.5-7B-Instruct
+DTYPE=half
+MAX_MODEL_LEN=4096
+GPU_MEMORY_UTILIZATION=0.80
+MAX_NUM_SEQS=16
+MAX_CONCURRENCY=4
+```
 
-Required env:
+For gated/private models, add `HF_TOKEN` as a RunPod Secret.
 
-- `MODEL_ID=Qwen/Qwen2.5-7B-Instruct`
+### Option 2. Build Your Own Image
 
-### 2. Baked Image
+```bash
+cd rvLLM-serverless
+./scripts/build.sh --tag your-registry/rvllm-serverless:latest --push
+```
 
-Bake a model snapshot into the image and serve from a local path like `/models/default`.
+To inspect the generated Docker command without building:
 
-Use this when:
+```bash
+cd rvLLM-serverless
+./scripts/build.sh --tag your-registry/rvllm-serverless:latest --dry-run
+```
 
-- cold-start predictability matters
-- your model is gated/private and you want controlled image contents
-- you want to avoid endpoint-time download latency
+### Option 3. Bake a Model into the Image
 
-The wrapper automatically keeps the **public** model name as the original Hugging Face repo id while `rvLLM` serves from the baked local directory.
+```bash
+cd rvLLM-serverless
+HF_TOKEN=hf_xxx ./scripts/build.sh \
+  --tag your-registry/rvllm-serverless:qwen25-7b \
+  --bake-model \
+  --model-id Qwen/Qwen2.5-7B-Instruct \
+  --push
+```
+
+For baked images, use runtime env like:
+
+```env
+MODEL_TARGET=/models/default
+SERVED_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+DTYPE=half
+MAX_MODEL_LEN=4096
+GPU_MEMORY_UTILIZATION=0.80
+MAX_NUM_SEQS=16
+MAX_CONCURRENCY=4
+```
+
+## How To Call It
+
+This is a queue-based RunPod worker, so call the RunPod endpoint APIs, not the container port directly.
+
+### List Models
+
+```bash
+curl --request POST \
+  --url "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
+  -H "authorization: <RUNPOD_API_KEY>" \
+  -H "content-type: application/json" \
+  -d '{
+    "input": {
+      "path": "/v1/models",
+      "method": "GET"
+    }
+  }'
+```
+
+### Chat Completion
+
+```bash
+curl --request POST \
+  --url "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
+  -H "authorization: <RUNPOD_API_KEY>" \
+  -H "content-type: application/json" \
+  -d '{
+    "input": {
+      "messages": [
+        {"role": "system", "content": "Answer briefly."},
+        {"role": "user", "content": "What is rvLLM?"}
+      ],
+      "temperature": 0.2,
+      "max_tokens": 128
+    }
+  }'
+```
+
+### Streamed Chat Completion
+
+```bash
+curl --request POST \
+  --url "https://api.runpod.ai/v2/<ENDPOINT_ID>/run" \
+  -H "authorization: <RUNPOD_API_KEY>" \
+  -H "content-type: application/json" \
+  -d '{
+    "input": {
+      "messages": [
+        {"role": "user", "content": "Write three bullet points about rvLLM."}
+      ],
+      "stream": true,
+      "max_tokens": 128
+    }
+  }'
+```
+
+Then read the stream with the returned job id:
+
+```bash
+curl --request GET \
+  --url "https://api.runpod.ai/v2/<ENDPOINT_ID>/stream/<JOB_ID>" \
+  -H "authorization: <RUNPOD_API_KEY>"
+```
+
+## Configuration
+
+### Core Runtime Variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MODEL_ID` | unset | Public Hugging Face model id for generic images. |
+| `MODEL_TARGET` | unset | Actual value passed to `rvllm serve --model`. |
+| `SERVED_MODEL_NAME` | `MODEL_ID` or `MODEL_TARGET` | Public model name exposed to clients. |
+| `TOKENIZER_ID` | unset | Optional tokenizer override. |
+| `HF_TOKEN` | unset | Hugging Face token for gated/private models. |
+| `HF_HOME` | `/runpod-volume/huggingface` | Hugging Face cache root. |
+| `HUGGINGFACE_HUB_CACHE` | `${HF_HOME}/hub` | Hugging Face hub cache path. |
+| `RVLLM_PORT` | `8000` | Local port used by `rvllm serve`. |
+| `MAX_CONCURRENCY` | `30` | RunPod worker concurrency hint. |
+| `SERVER_READY_TIMEOUT` | `900` | Startup timeout in seconds. |
+| `REQUEST_TIMEOUT` | `600` | Proxy request timeout in seconds. |
+
+### `rvLLM` Launch Variables
+
+| Variable | Default |
+| --- | --- |
+| `DTYPE` | `auto` |
+| `MAX_MODEL_LEN` | `2048` |
+| `GPU_MEMORY_UTILIZATION` | `0.9` |
+| `TENSOR_PARALLEL_SIZE` | `1` |
+| `MAX_NUM_SEQS` | `256` |
+| `RUST_LOG` | `info` |
+| `DISABLE_TELEMETRY` | `false` |
+
+## Job Input Contract
+
+The worker accepts two styles of input.
+
+### Direct OpenAI-Style Input
+
+If `input` contains `messages`, it becomes `/v1/chat/completions`.
+
+```json
+{
+  "input": {
+    "messages": [
+      { "role": "user", "content": "What is rvLLM?" }
+    ],
+    "max_tokens": 128
+  }
+}
+```
+
+If `input` contains `prompt`, it becomes `/v1/completions`.
+
+```json
+{
+  "input": {
+    "prompt": "Write a one-line summary of RunPod Serverless.",
+    "max_tokens": 64
+  }
+}
+```
+
+If `model` is omitted, the worker injects `SERVED_MODEL_NAME`.
+
+### Explicit Proxy Input
+
+If you want direct control over the local endpoint:
+
+```json
+{
+  "input": {
+    "path": "/v1/chat/completions",
+    "method": "POST",
+    "body": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "messages": [
+        { "role": "user", "content": "Return JSON only." }
+      ],
+      "stream": true
+    }
+  }
+}
+```
 
 ## Repository Layout
 
@@ -74,235 +277,25 @@ rvLLM-serverless/
     └── test_request_mapping.py
 ```
 
-## Configuration
+## Verification
 
-### Core Runtime Variables
+What has been verified so far:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `MODEL_ID` | unset | Public model id. Also used as the runtime model target when `MODEL_TARGET` is not set. |
-| `MODEL_TARGET` | unset | Actual value passed to `rvllm serve --model`. Use this when serving a baked local directory. |
-| `SERVED_MODEL_NAME` | `MODEL_ID` or `MODEL_TARGET` | Public model name exposed through `/v1/models` and accepted in request bodies. |
-| `TOKENIZER_ID` | unset | Optional tokenizer override passed to `rvllm serve --tokenizer`. |
-| `HF_TOKEN` | unset | Hugging Face token for gated/private models. |
-| `HF_HOME` | `/runpod-volume/huggingface` | Hugging Face cache root. |
-| `HUGGINGFACE_HUB_CACHE` | `${HF_HOME}/hub` | Explicit HF hub cache path. |
-| `RVLLM_PORT` | `8000` | Local port used by `rvllm serve`. |
-| `MAX_CONCURRENCY` | `30` | RunPod worker concurrency hint. |
-| `SERVER_READY_TIMEOUT` | `900` | Seconds to wait for `rvLLM` health before failing startup. |
-| `REQUEST_TIMEOUT` | `600` | Seconds to wait for proxied HTTP requests. |
+- local Python tests for config and request mapping
+- local Docker build flow on macOS with `linux/amd64`
+- published Docker image build and push
+- real RunPod GPU startup testing
+- startup fix for missing PTX kernel packaging
 
-### `rvLLM` Launch Variables
-
-These are translated into `rvllm serve` flags:
-
-| Variable | Default |
-| --- | --- |
-| `DTYPE` | `auto` |
-| `MAX_MODEL_LEN` | `2048` |
-| `GPU_MEMORY_UTILIZATION` | `0.9` |
-| `TENSOR_PARALLEL_SIZE` | `1` |
-| `MAX_NUM_SEQS` | `256` |
-| `RUST_LOG` | `info` |
-| `DISABLE_TELEMETRY` | `false` |
-
-## Job Input Contract
-
-The worker supports two clean input styles.
-
-### A. Direct OpenAI-style Input
-
-If `input` already looks like a chat/completions payload, the route is inferred automatically.
-
-Chat example:
-
-```json
-{
-  "input": {
-    "messages": [
-      { "role": "system", "content": "Answer briefly." },
-      { "role": "user", "content": "What is rvLLM?" }
-    ],
-    "temperature": 0.2,
-    "max_tokens": 128,
-    "stream": false
-  }
-}
-```
-
-Completion example:
-
-```json
-{
-  "input": {
-    "prompt": "Write a one-line summary of RunPod Serverless.",
-    "max_tokens": 64
-  }
-}
-```
-
-If `model` is omitted, the worker injects `SERVED_MODEL_NAME` automatically.
-
-### B. Explicit Proxy Input
-
-Use this when you want full control over the local OpenAI-compatible endpoint:
-
-```json
-{
-  "input": {
-    "path": "/v1/models",
-    "method": "GET"
-  }
-}
-```
-
-Or:
-
-```json
-{
-  "input": {
-    "path": "/v1/chat/completions",
-    "method": "POST",
-    "body": {
-      "model": "Qwen/Qwen2.5-7B-Instruct",
-      "messages": [
-        { "role": "user", "content": "Return JSON only." }
-      ],
-      "stream": true
-    }
-  }
-}
-```
-
-## Local Build on macOS
-
-This workspace already contains sibling folders:
-
-- `rvllm/`
-- `rvLLM-serverless/`
-
-The included build script stages only those folders into a temporary Docker context, so you can build on macOS without copying the entire workspace into Docker.
-
-### Prerequisites
-
-- Docker Desktop
-- BuildKit enabled
-- enough disk for Rust + CUDA build artifacts
-- optional: registry login if you plan to push the image
-
-### Build a Generic Image
-
-```bash
-cd rvLLM-serverless
-./scripts/build.sh --tag your-registry/rvllm-serverless:latest
-```
-
-To validate the staged Docker command without starting a build:
-
-```bash
-cd rvLLM-serverless
-./scripts/build.sh --tag your-registry/rvllm-serverless:latest --dry-run
-```
-
-### Build a Baked Image
-
-```bash
-cd rvLLM-serverless
-HF_TOKEN=hf_xxx ./scripts/build.sh \
-  --tag your-registry/rvllm-serverless:qwen25-7b \
-  --bake-model \
-  --model-id Qwen/Qwen2.5-7B-Instruct
-```
-
-### Push After Build
-
-```bash
-cd rvLLM-serverless
-./scripts/build.sh --tag your-registry/rvllm-serverless:latest --push
-```
-
-## RunPod Deployment
-
-### Option 1. Deploy the Generic Image
-
-Endpoint environment example:
-
-```env
-MODEL_ID=Qwen/Qwen2.5-7B-Instruct
-DTYPE=half
-MAX_MODEL_LEN=8192
-GPU_MEMORY_UTILIZATION=0.92
-MAX_NUM_SEQS=128
-HF_TOKEN=hf_xxx
-```
-
-### Option 2. Deploy a Baked Image
-
-Endpoint environment example:
-
-```env
-MODEL_TARGET=/models/default
-SERVED_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
-DTYPE=half
-MAX_MODEL_LEN=8192
-GPU_MEMORY_UTILIZATION=0.92
-MAX_NUM_SEQS=128
-```
-
-For baked images, requests can still use:
-
-```json
-{ "model": "Qwen/Qwen2.5-7B-Instruct" }
-```
-
-The proxy rewrites that to the local baked path before forwarding to `rvLLM`.
-
-## How Streaming Works
-
-`rvLLM` emits OpenAI-style SSE on the local HTTP port. The RunPod worker parses those events and yields JSON chunks through the RunPod streaming interface.
-
-Implications:
-
-- use RunPod `/stream` when you want incremental output
-- use RunPod `/run` or `/runsync` for non-streaming requests
-- streamed chunks preserve the OpenAI response shape, but transport is RunPod streaming, not raw SSE passthrough
-
-## What Was Verified on macOS
-
-This repo is set up so the following checks can be run without H100 access:
-
-- Python import and syntax validation for the serverless wrapper
-- request-shape and config resolution tests in `tests/`
-- Docker build command generation and staging workflow
-
-Run:
+Run local checks:
 
 ```bash
 cd rvLLM-serverless
 ./scripts/smoke_test.sh
 ```
 
-## What Still Needs H100 Validation
-
-These should be done once GPU access is available:
-
-1. First cold boot with a real Hugging Face model on RunPod Serverless.
-2. End-to-end `/v1/chat/completions` latency and startup timings.
-3. `DTYPE`, `MAX_MODEL_LEN`, and `MAX_NUM_SEQS` tuning on H100.
-4. Behavior under concurrent traffic and large prompt loads.
-5. Model compatibility checks for the exact model families you plan to serve.
-
-## Recommended Next H100 Session
-
-When H100 access is available, the fastest validation order is:
-
-1. Deploy the generic image with a small known-good model.
-2. Confirm `/v1/models`, non-stream chat, and streaming chat.
-3. Move to the target production model.
-4. Decide whether baked image is worth the larger image size versus first-boot download.
-
 ## Notes
 
-- The wrapper currently targets the existing `rvllm serve` CLI surface and does not add a new inference API.
-- This repository intentionally prefers a thin wrapper over deep `rvLLM` modifications.
-- If later needed, the next reasonable improvement is a serverless-native Rust entrypoint inside `rvLLM` itself, but that is not required to get the image built and deployed.
+- The wrapper intentionally targets the existing `rvllm serve` CLI surface.
+- This repo is meant to stay thin. Inference behavior belongs in `rvLLM`, not here.
+- PTX kernels are compiled during image build and packaged into the runtime image.
